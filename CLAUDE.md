@@ -33,7 +33,7 @@ Nació de una reescritura: el proyecto original era una sola app de Next.js con 
 
 **Con la Fase 3 el backend está completo.** Lo que sigue ocurre entero en el repo del front (Fases 4 a 8); aquí no hay trabajo pendiente salvo lo listado en "Deuda consciente" más abajo.
 
-**Desplegado y funcionando** en Render: `https://beverage-ledger-api.onrender.com`. Ver §4.
+**Desplegado y funcionando** en Render: `https://beverage-ledger-api-jfzo.onrender.com`. Ver §4.
 
 El plan completo de fases vive fuera del repositorio, en la máquina de quien lo escribió; no cuentes con poder leerlo.
 
@@ -138,8 +138,22 @@ Decisiones que quedaron tomadas al construirlo:
 - **Credenciales de Google OAuth** sin crear en Google Cloud Console (ver arriba). Nada más depende de ello.
 - **La estructura del documento PDF queda pendiente de revisión.** El layout actual es una migración del que había en el front, con las columnas reducidas a lo que el ledger realmente guarda: nombre y marca del snapshot, cantidad, unidad y unidades base. El resto de los campos del original (origen, ABV, añejamiento, subcategoría) vivían en el blob JSON denormalizado y ahora están en `products`, no en la línea del movimiento — meterlos en el documento significa decidir si se leen del producto actual (y entonces un reimpreso viejo deja de ser fiel) o si el snapshot debe crecer. **Es una decisión de producto, no de código, y se aborda en una fase posterior** junto con la revisión visual del layout.
 - **El PDF usa las fuentes estándar**, que son WinAnsi: 218 caracteres, Windows-1252. Cubre los acentos del español, la raya y las comillas curvas, y `drawText` **lanza excepción** con cualquier cosa fuera de ese juego. `movement-pdf.service.ts` le pregunta a la fuente qué soporta y solo pliega lo que de verdad no cabe (a su letra base, o a `?` como último recurso). El arreglo definitivo es embeber una fuente Unicode, a costa de versionar un archivo de fuente.
-- **El proceso de V&V lo diseña el usuario**, así que no añadas herramienta de pruebas nueva sin que te la pidan. Lo que ya existe: **Vitest** con las pruebas de caminos en `test/` (`pnpm test`, `pnpm test:coverage`) y un workflow de **GitHub Actions** que publica el coverage en SonarCloud. Los tests corren con dobles hechos a mano —ni `@nestjs/testing` ni base de datos—, así que son deterministas y no necesitan red. El coverage está acotado a los archivos que alguna prueba ejecuta: `coverage.include` en `vitest.config.mts` los lista y `sonar.coverage.exclusions` escribe el complemento, y las dos listas se mueven juntas. Un archivo nuevo bajo prueba se añade a **las dos**, porque SWC borra los `import type` y un módulo que el test solo importa como tipo no aparecería.
+- **El proceso de V&V lo diseña el usuario**, así que no añadas herramienta de pruebas nueva sin que te la pidan. Lo que ya existe: **Vitest** con cuatro proyectos en `vitest.config.mts` y un workflow de **GitHub Actions** que publica el coverage en SonarCloud:
+
+  | Proyecto | Carpeta | Contra qué corre |
+  |---|---|---|
+  | `unit` | `test/*.test.ts` | dobles hechos a mano |
+  | `funcional` | `test/regression/funcional/` | dobles hechos a mano |
+  | `api` | `test/regression/api/` | **la API desplegada en Render** |
+  | `seguridad` | `test/regression/seguridad/` | **la API desplegada en Render** |
+
+  Las dos primeras son deterministas y no necesitan red: ni `@nestjs/testing` ni base de datos. Las de regresión cubren solo las 6 funcionalidades que ya tenían regresión: RF-01, 03, 06, 09, 29 y 30.
+- **`api` y `seguridad` escriben en la base de producción**, por decisión del usuario, a través de cuentas fijas de CI (`CI_ADMIN`, `CI_MANAGER`, `CI_OPERATOR` y `CI_LOCKOUT`, esta última solo para que la prueba de bloqueo la bloquee) y del producto fijo `[CI] Producto de prueba`, que se edita y se restaura. Lo único que se acumula es **un miembro suspendido por corrida**: el global setup acepta una invitación, porque un usuario no se borra, y lo suspende al terminar. Toda llamada a login, refresh y las rutas públicas de invitación pasa por un presupuesto compartido en un archivo (`test/support/http.ts`), uno por debajo de `AUTH_THROTTLE`, para que la suite no tropiece con su propio 429.
+- **Las cuentas de CI las crea el seed**, con correos fijos (`ci.admin@`, `ci.manager@`, `ci.operator@` y `ci.lockout@beverageledger.test`) y la contraseña de `SEED_CI_<ROL>_PASSWORD`: sin la variable, esa cuenta no se siembra, para que un `db:seed` normal no deje un administrador de prueba con contraseña conocida. Volver a sembrar reaplica contraseña, rol y estado y desbloquea, así que también es como se recupera la cuenta de bloqueo. Contra una base en uso se corre **`pnpm db:seed:ci`**, que no toca nada más: el seed completo busca productos por nombre y categorías y marcas por slug, y devolvería uno que alguien renombró o borró.
+- **Las pruebas pendientes de la heurística van como `it.skip`** con el número de pregunta en el nombre: hoy, la 36 (búsqueda tolerante a errores tipográficos). Se activan cuando exista la función, como pasó con la 33: `AllExceptionsFilter` añade a todo error un `code` (`ERR-` + 8 hex) que la persona cita al reportarlo y que va en la línea del log de cada 5xx. El coverage está acotado a los archivos que alguna prueba ejecuta: `coverage.include` en `vitest.config.mts` los lista y `sonar.coverage.exclusions` escribe el complemento, y las dos listas se mueven juntas. Un archivo nuevo bajo prueba se añade a **las dos**, porque SWC borra los `import type` y un módulo que el test solo importa como tipo no aparecería.
 - **Convención de los tests**: un archivo por requisito, `rf-NN-back-<caso>.test.ts`, y un `it` por camino de la prueba de caja blanca (`'Camino 1 - …'`). Los nombres de `describe`/`it` y las variables locales de los tests van en español, excepción aceptada a §7 porque son la traza hacia el documento de V&V. Los services se instancian con `new` y repositorios `vi.fn()` casteados con `as unknown as`. Varios tests importan enums del cliente generado como valores: sin `pnpm db:generate` la suite ni carga.
+- **Keploy graba y reproduce el tráfico de la API** con `scripts/keploy-regression.sh`, el mismo script en todos lados. En `ci.yml` y en el `Jenkinsfile` es una fase de regresión **que bloquea el despliegue**: compara contra el commit anterior al push (`github.event.before`, o el último que construyó Jenkins), o contra la rama base en un PR. `ia.yml` y `Jenkinsfile.ia` (job `beverage-ledger-api-ia`) lo corren solo a mano, contra la versión que se pida. En Jenkins, que no tiene eBPF ni root, el script corre en un contenedor `--privileged` hermano lanzado por el socket de Docker, junto a un Postgres desechable (ver el README de `jenkins/beverage-ledger/`). Sobre un Postgres desechable que pone quien lo llama (un servicio del runner o un contenedor hermano), el script siembra las cuentas de CI con contraseñas generadas en esa corrida, **graba la versión anterior** (`HEAD~1`, o la que se pida al lanzarlo) con el tráfico de `scripts/keploy-traffic.mjs` y **reproduce contra este commit** con Postgres respondido desde los mocks grabados: una respuesta que cambió es una regresión. Grabar y reproducir en el mismo job no es capricho: los access tokens grabados caducan a los 15 minutos, así que una grabación versionada en git dejaría de servir. `keploy.yaml` declara como ruido lo que cambia legítimamente (tokens, la cookie de refresh, fechas, `uptimeSeconds`, el `commit` de `/health`); las grabaciones van a `keploy/`, gitignorado. Keploy necesita Linux con eBPF y `sudo`: no corre en Windows, y en local se probó dentro de un contenedor `--privileged`.
+- **`api` y `seguridad` corren después del despliegue**, en `ci.yml` y en el `Jenkinsfile`: llaman a la API de Render, así que antes del despliegue probaban la versión anterior y no el commit en construcción (así falló el `code` de error recién añadido). El hook de Render responde al encolar, no al terminar, por lo que el despliegue espera hasta que `/health` devuelva en `commit` el SHA probado (`RENDER_GIT_COMMIT`, que pone Render en cada despliegue de Git), con un tope de 20 minutos. Un fallo ya no frena el despliegue: avisa de una regresión que está en producción. Fuera de `main` no se despliega nada, y prueban lo que sirve producción. `pnpm audit --prod` se movió a la revisión estática para seguir bloqueando.
 - **`pnpm test:clean`** (`scripts/clean-test-movements.ts`) borra de la base los borradores con nota `vitest` que dejaba una versión anterior de las pruebas, cuando sí tocaban la base. Hoy ninguna prueba la toca.
 - **Las pantallas nuevas del front no las ha recorrido nadie.** El backend se ejerció de punta a punta contra una base real —ciclo de traspaso, anulación, matriz de reglas e invariante en cero descuadres— y el backfill se verificó sobre los datos de Supabase, pero el CRUD de bodegas, la captura de traspaso y el tope del picker solo tienen typecheck, lint y build.
 
@@ -161,15 +175,20 @@ pnpm lint             # ESLint (lint:fix para corregir)
 pnpm typecheck        # tsc --noEmit
 pnpm format           # Prettier (format:check en modo verificación)
 
-pnpm test                                   # Vitest, toda la suite
+pnpm test                                   # unitarias y funcionales: sin red
+pnpm test:unit                              # solo unitarias
+pnpm test:funcional                         # solo regresión funcional
+pnpm test:api                               # regresión de API, contra API_URL
+pnpm test:seguridad                         # regresión de seguridad, contra API_URL
 pnpm test test/rf-23-back-resolve-location  # un archivo (filtro por ruta)
 pnpm test -t "Camino 2"                     # por nombre de it/describe
-pnpm test:coverage                          # con coverage, como en CI
+pnpm test:coverage                          # unitarias y funcionales con coverage
 
 pnpm db:migrate       # prisma migrate dev
 pnpm db:generate      # regenera el cliente en src/generated/prisma
 pnpm db:seed          # catálogo completo, stock en CERO
 pnpm db:seed:demo     # además, stock simulado e histórico de salidas
+pnpm db:seed:ci       # solo las cuentas de CI, para una base que ya está en uso
 pnpm db:studio        # inspector de datos
 pnpm db:reset         # borra y rehace todo (destructivo)
 ```
@@ -215,7 +234,7 @@ Si una contraseña contiene `/ % @ :` hay que **URL-encodearla** o la conexión 
 
 ### Despliegue
 
-La API vive en **Render** (`https://beverage-ledger-api.onrender.com`) y el front en **Vercel**, descritos en `render.yaml`. Los secretos van marcados `sync: false`: Render los pide una vez en el panel y nunca tocan el repositorio.
+La API vive en **Render** (`https://beverage-ledger-api-jfzo.onrender.com`) y el front en **Vercel**, descritos en `render.yaml`. Los secretos van marcados `sync: false`: Render los pide una vez en el panel y nunca tocan el repositorio.
 
 Las migraciones corren en el `buildCommand`, no al arrancar: `migrate deploy` es idempotente y un fallo debe abortar el despliegue en vez de dejar una instancia en bucle de reinicio. El *pre-deploy hook* de Render, que es donde corresponderían, es de pago.
 
@@ -231,6 +250,8 @@ Detalles que costaron un despliegue fallido cada uno:
 
 ### CI con Jenkins
 
+> **Desactivado: el pipeline activo es GitHub Actions** (`ci.yml` y `ia.yml`). Los jobs de Jenkins siguen definidos en `casc.yaml` con `disabled(true)` y los `Jenkinsfile` se mantienen al día, pero no corren. No actives los dos a la vez: ambos despliegan y comparten el límite de login de la API. Lo que sigue describe Jenkins para cuando se reactive.
+
 Además del workflow de GitHub Actions, el pipeline está en el `Jenkinsfile` de la raíz. **El servidor no vive en este repo**: es una instancia compartida con el front, definida en la carpeta `jenkins/beverage-ledger/`, hermana de los clones (sin versionar). Allí están la imagen con Node 22 y corepack, los plugins, un **SonarQube local** con su Postgres (http://localhost:9000) y toda la configuración como código (`casc.yaml`): usuario admin, credenciales y los dos jobs, `beverage-ledger-api` y `beverage-ledger`. No hay asistente de instalación; lo que se cambie en la UI se pierde al reiniciar.
 
 ```bash
@@ -239,7 +260,8 @@ cp .env.example .env          # admin, SONAR_TOKEN y los datos del front
 docker compose up -d --build  # Jenkins en :8080, SonarQube en :9000
 ```
 
-- **Las fases, en orden**: `Instalación de dependencias` (incluye `db:generate`) → `Revisión estática` (lint, tipos y formato, seguidos y no en paralelo: el primero que falla corta) → `Pruebas (unitarias, regresión)` → `Compilación` → `Calidad (SonarQube)` → `Despliegue`. Cada una se detiene si falla, y ninguna posterior corre.
+- **Las fases, en orden**: `Instalación de dependencias` (incluye `db:generate`) → `Revisión estática` (lint, tipos, formato y `pnpm audit --prod --audit-level high`, seguidos y no en paralelo: el primero que falla corta) → `Pruebas unitarias` → `Compilación` → `Pruebas de regresión` (`Funcionales` → `Keploy (captura y reproducción)`) → `Calidad (SonarQube)` → `Despliegue` (espera a que Render sirva el commit) → `Pruebas de regresión: API` → `Pruebas de regresión: Seguridad`. Cada una se detiene si falla, y ninguna posterior corre. Sonar lee el coverage de `coverage/unit` y `coverage/funcional`.
+- **Las pruebas contra Render corren bajo `lock('render-api')`** (plugin `lockable-resources`), que comparten con las de navegador del job web: las dos salen de la misma IP y gastarían el mismo límite de login. Van después del despliegue, como en GitHub Actions, así que prueban el commit recién desplegado.
 - **Despliega Jenkins, no Render.** `render.yaml` lleva `autoDeployTrigger: off`; la fase `Despliegue` llama al *deploy hook* del servicio (`RENDER_DEPLOY_HOOK`) con `ref=<commit>` solo en `main` y solo si pasaron todas las fases anteriores, umbral de calidad de SonarQube incluido. El hook responde al encolar el despliegue, no al terminarlo: el resultado se ve en Render.
 - **El stage de análisis va contra el SonarQube local, no contra SonarCloud**: el servidor sale de `SONAR_HOST_URL`, que pone Jenkins, y el `Jenkinsfile` no nombra ninguno. GitHub Actions sigue analizando en SonarCloud con `sonar-project.properties`, cuyo `sonar.organization` el SonarQube local ignora.
 - **El job lee el `Jenkinsfile` de GitHub**, no del disco: un cambio al pipeline no corre hasta que se empuja. Un push a `main` lanza el build en segundos: el webhook del repo apunta a un canal de smee.io y el contenedor `smee` lo reenvía a Jenkins, que nunca queda expuesto a internet. Un sondeo cada 15 minutos recoge lo que se haya empujado con el relé apagado. El repo es privado: Jenkins clona con la credencial `github`, un token de solo lectura que va en `GITHUB_TOKEN` del `.env`.

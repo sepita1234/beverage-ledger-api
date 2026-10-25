@@ -47,26 +47,30 @@ jobs:
         run: pnpm typecheck
       - name: Formato
         run: pnpm format:check
+      # Production dependencies only: dev tooling never reaches Render. Here and
+      # not with the security suite, which runs after the deploy.
+      - name: Auditoría de dependencias
+        run: pnpm audit --prod --audit-level high
 
-  test:
-    name: Pruebas (unitarias, regresión)
+  unit:
+    name: Pruebas unitarias
     needs: static
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup
-      - name: Pruebas con coverage
-        run: pnpm test:coverage
+      - name: Pruebas unitarias con coverage
+        run: pnpm test:unit --coverage --coverage.reportsDirectory=coverage/unit
       - name: Guardar el reporte de coverage
         uses: actions/upload-artifact@v4
         with:
-          name: coverage
-          path: coverage/lcov.info
+          name: coverage-unit
+          path: coverage/unit/lcov.info
           retention-days: 7
 
   build:
     name: Compilación
-    needs: test
+    needs: unit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -74,9 +78,97 @@ jobs:
       - name: Compilación
         run: pnpm build
 
+  functional:
+    name: 'Pruebas de regresión: Funcionales'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Pruebas funcionales con coverage
+        run: pnpm test:funcional --coverage --coverage.reportsDirectory=coverage/funcional
+      - name: Guardar el reporte de coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-funcional
+          path: coverage/funcional/lcov.info
+          retention-days: 7
+
+  # Records the version before this push (or the PR's base) and replays it
+  # against this commit with Postgres mocked: a changed answer blocks the deploy.
+  # Deterministic, unlike the model-driven suites, so it can gate. Nothing here
+  # touches Render or Supabase; the API runs on the runner.
+  keploy:
+    name: 'Pruebas de regresión: Keploy (captura y reproducción)'
+    needs: functional
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: beverage_ledger
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/beverage_ledger
+      DIRECT_URL: postgresql://postgres:postgres@localhost:5432/beverage_ledger
+      CI_ADMIN_EMAIL: ci.admin@beverageledger.test
+      CI_MANAGER_EMAIL: ci.manager@beverageledger.test
+      CI_OPERATOR_EMAIL: ci.operator@beverageledger.test
+      KEPLOY_VERSION: v3.6.131
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Throwaway: the database dies with the runner, so the uploaded recordings
+      # never hold a credential that works anywhere.
+      - name: Credenciales de esta corrida
+        run: |
+          for name in JWT_SECRET CI_ADMIN_PASSWORD CI_MANAGER_PASSWORD CI_OPERATOR_PASSWORD; do
+            value="Ci-$(openssl rand -hex 24)-Kp1"
+            echo "::add-mask::$value"
+            echo "$name=$value" >> "$GITHUB_ENV"
+          done
+      - uses: ./.github/actions/setup
+      - name: Instalar Keploy
+        run: |
+          curl -sSfL "https://github.com/keploy/keploy/releases/download/$KEPLOY_VERSION/keploy_linux_amd64.tar.gz" \
+            | sudo tar -xz -C /usr/local/bin keploy
+          keploy --version
+      # A push of several commits compares against what main had before it; a
+      # new branch, a re-run or a missing commit falls back to the parent.
+      - name: Grabar la versión anterior y reproducir contra este commit
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          base=HEAD~1
+          if [ "$EVENT" = pull_request ]; then
+            base="origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            base="$BEFORE"
+          fi
+          KEPLOY_SUDO=sudo bash scripts/keploy-regression.sh "$base"
+      - name: Guardar las pruebas, los mocks y el reporte
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keploy
+          path: |
+            keploy
+            keploy-record.log
+          retention-days: 14
+
   quality:
     name: Calidad (SonarQube Cloud)
-    needs: build
+    needs: keploy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -84,11 +176,17 @@ jobs:
           # Sonar needs the full history to attribute code and compute "new code".
           fetch-depth: 0
       - uses: ./.github/actions/setup
-      - name: Recuperar el reporte de coverage
+      - name: Recuperar los reportes de coverage
         uses: actions/download-artifact@v4
         with:
-          name: coverage
+          pattern: coverage-*
           path: coverage
+      # download-artifact puts each one in a folder named after it.
+      - name: Ordenar los reportes como los espera sonar-project.properties
+        run: |
+          mkdir -p coverage/unit coverage/funcional
+          mv coverage/coverage-unit/lcov.info coverage/unit/lcov.info
+          mv coverage/coverage-funcional/lcov.info coverage/funcional/lcov.info
       # sonar-project.properties carries the analysis settings; the
       # organization and project key come from repository variables so the
       # same file serves whichever SonarQube Cloud account imports the repo.
@@ -121,3 +219,58 @@ jobs:
         env:
           RENDER_DEPLOY_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
         run: curl --fail --silent --show-error -X POST "$RENDER_DEPLOY_HOOK&ref=$GITHUB_SHA"
+      # The hook answers once the deploy is queued, not once it is live: the
+      # suites below must not start against the version before it.
+      - name: Esperar a que Render sirva este commit
+        env:
+          API_URL: ${{ vars.API_URL }}
+        run: |
+          for attempt in $(seq 1 80); do
+            served=$(curl --silent --max-time 20 "$API_URL/api/v1/health" | jq -r '.commit // empty' 2>/dev/null || true)
+            if [ -n "$served" ] && [ "${GITHUB_SHA#"$served"}" != "$GITHUB_SHA" ]; then
+              echo "Render sirve $served"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "::error::Render no sirve $GITHUB_SHA tras 20 minutos"
+          exit 1
+
+  # After the deploy: they call the API on Render, which now serves this commit,
+  # and write to its database through dedicated CI accounts. A failure no longer
+  # stops the deploy, it reports a regression already in production. On a pull
+  # request nothing is deployed, so they check what production serves. One at a
+  # time across runs: they share the login rate limit.
+  api:
+    name: 'Pruebas de regresión: API'
+    needs: [quality, deploy]
+    if: ${{ !cancelled() && needs.quality.result == 'success' && needs.deploy.result != 'failure' }}
+    runs-on: ubuntu-latest
+    concurrency: { group: render-api, cancel-in-progress: false }
+    env: &deployed-api
+      API_URL: ${{ vars.API_URL }}
+      CI_ADMIN_EMAIL: ${{ secrets.CI_ADMIN_EMAIL }}
+      CI_ADMIN_PASSWORD: ${{ secrets.CI_ADMIN_PASSWORD }}
+      CI_MANAGER_EMAIL: ${{ secrets.CI_MANAGER_EMAIL }}
+      CI_MANAGER_PASSWORD: ${{ secrets.CI_MANAGER_PASSWORD }}
+      CI_OPERATOR_EMAIL: ${{ secrets.CI_OPERATOR_EMAIL }}
+      CI_OPERATOR_PASSWORD: ${{ secrets.CI_OPERATOR_PASSWORD }}
+      CI_LOCKOUT_EMAIL: ${{ secrets.CI_LOCKOUT_EMAIL }}
+      CI_LOCKOUT_PASSWORD: ${{ secrets.CI_LOCKOUT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Pruebas de API
+        run: pnpm test:api
+
+  security:
+    name: 'Pruebas de regresión: Seguridad'
+    needs: api
+    runs-on: ubuntu-latest
+    concurrency: { group: render-api, cancel-in-progress: false }
+    env: *deployed-api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup
+      - name: Pruebas de seguridad
+        run: pnpm test:seguridad
